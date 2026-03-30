@@ -214,6 +214,10 @@ void StopTrace();
 void StartBinaryTrace(const char* path, uint32_t limit = 0);
 void StopBinaryTrace();
 
+// Write an event marker to the binary trace (e.g. VBlank).
+// Marker format: pc=0xFFFFFFFF, insn=tick_value, ticks=event_type.
+void WriteBinaryTraceEvent(u32 event_type, u32 tick_value);
+
 // Breakpoint types - execute => breakpoint, read/write => watchpoints
 enum class BreakpointType : u8
 {

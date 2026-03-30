@@ -3,6 +3,7 @@
 
 #include "interrupt_controller.h"
 #include "cpu_core.h"
+#include "system.h"
 
 #include "util/state_wrapper.h"
 
@@ -57,6 +58,13 @@ void InterruptController::SetLineState(IRQ irq, bool state)
   else if ((prev_state & bit) && !state)
     DEBUG_LOG("{} IRQ line inactive", s_irq_names[static_cast<size_t>(irq)]);
 #endif
+
+  // Emit VBlank event marker to binary trace on 0→1 transition
+  if (!(prev_state & bit) && state && irq == IRQ::VBLANK)
+  {
+    CPU::WriteBinaryTraceEvent(1, static_cast<u32>(
+      System::GetGlobalTickCounter() + CPU::GetPendingTicks()));
+  }
 
   s_interrupt_status_register |= (state ? (prev_state ^ s_interrupt_line_state) : 0u) & s_interrupt_line_state;
   UpdateCPUInterruptRequest();

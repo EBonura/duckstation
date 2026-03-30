@@ -180,6 +180,18 @@ void CPU::StopBinaryTrace()
   }
 }
 
+void CPU::WriteBinaryTraceEvent(u32 event_type, u32 tick_value)
+{
+  if (!s_binary_trace_file)
+    return;
+  struct { u32 pc; u32 insn; u32 ticks; } entry = {
+    0xFFFFFFFF,  // sentinel PC
+    tick_value,
+    event_type
+  };
+  std::fwrite(&entry, sizeof(entry), 1, s_binary_trace_file);
+}
+
 void CPU::WriteToExecutionLog(const char* format, ...)
 {
   if (!s_locals.log_file_opened) [[unlikely]]
