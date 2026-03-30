@@ -9,6 +9,7 @@
 #include "cpu_pgxp.h"
 #include "gte.h"
 #include "host.h"
+#include "interrupt_controller.h"
 #include "pcdrv.h"
 #include "pio.h"
 #include "settings.h"
@@ -184,12 +185,13 @@ void CPU::WriteBinaryTraceEvent(u32 event_type, u32 tick_value)
 {
   if (!s_binary_trace_file)
     return;
-  struct { u32 pc; u32 insn; u32 ticks; } entry = {
-    0xFFFFFFFF,  // sentinel PC
-    tick_value,
-    event_type
-  };
-  std::fwrite(&entry, sizeof(entry), 1, s_binary_trace_file);
+  // Pad to 168 bytes with zeros, sentinel in first field
+  u8 buf[168] = {};
+  u32 sentinel = 0xFFFFFFFF;
+  std::memcpy(buf, &sentinel, 4);       // gpr[0] = sentinel
+  std::memcpy(buf + 4, &tick_value, 4); // gpr[1] = tick
+  std::memcpy(buf + 8, &event_type, 4); // gpr[2] = type
+  std::fwrite(buf, sizeof(buf), 1, s_binary_trace_file);
 }
 
 void CPU::WriteToExecutionLog(const char* format, ...)
@@ -2606,14 +2608,36 @@ template<PGXPMode pgxp_mode, bool debug>
       // next load delay
       UpdateLoadDelay();
 
-      // Binary instruction trace (pc, instruction, per-instruction ticks)
+      // Binary instruction trace — full 168-byte CPU state per instruction
       if (s_binary_trace_file) [[unlikely]]
       {
-        struct { u32 pc; u32 insn; u32 ticks; } entry = {
-          g_state.current_instruction_pc,
-          g_state.current_instruction.bits,
-          g_state.pending_ticks - pre_ticks
+#pragma pack(push, 1)
+        struct TraceEntry {
+          u32 gpr[32];
+          u32 pc, hi, lo;
+          u32 sr, cause, epc;
+          u16 i_stat, i_mask;
+          u32 ticks, pending, insn;
         };
+#pragma pack(pop)
+        static_assert(sizeof(TraceEntry) == 168, "TraceEntry must be exactly 168 bytes");
+        TraceEntry entry;
+
+        // GPRs — snapshot AFTER UpdateLoadDelay
+        std::memcpy(entry.gpr, g_state.regs.r, sizeof(entry.gpr));
+        entry.gpr[0] = 0; // R0 is always zero
+        entry.pc = g_state.current_instruction_pc;
+        entry.hi = g_state.regs.hi;
+        entry.lo = g_state.regs.lo;
+        entry.sr = g_state.cop0_regs.sr.bits;
+        entry.cause = g_state.cop0_regs.cause.bits;
+        entry.epc = g_state.cop0_regs.EPC;
+        entry.i_stat = static_cast<u16>(InterruptController::ReadRegister(0)); // I_STAT
+        entry.i_mask = static_cast<u16>(InterruptController::ReadRegister(4)); // I_MASK
+        entry.ticks = g_state.pending_ticks - pre_ticks;
+        entry.pending = g_state.pending_ticks;
+        entry.insn = g_state.current_instruction.bits;
+
         std::fwrite(&entry, sizeof(entry), 1, s_binary_trace_file);
         if (++s_binary_trace_count == s_binary_trace_limit && s_binary_trace_limit > 0)
           StopBinaryTrace();
