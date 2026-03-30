@@ -79,6 +79,9 @@ struct State
   u32 gte_completion_tick = 0;
   u32 muldiv_completion_tick = 0;
 
+  // total instructions executed since boot (for comparison testing)
+  u64 total_instructions = 0;
+
   Registers regs = {};
   Cop0Registers cop0_regs = {};
 
@@ -206,6 +209,10 @@ void WriteToExecutionLog(const char* format, ...) PRINTFLIKE(1, 2);
 bool IsTraceEnabled();
 void StartTrace();
 void StopTrace();
+
+// Binary instruction trace (for parity testing with PSoXide).
+void StartBinaryTrace(const char* path, uint32_t limit = 0);
+void StopBinaryTrace();
 
 // Breakpoint types - execute => breakpoint, read/write => watchpoints
 enum class BreakpointType : u8

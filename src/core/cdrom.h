@@ -52,4 +52,10 @@ void DisableReadSpeedup();
 /// Reads a frame from the audio FIFO, used by the SPU.
 std::tuple<s16, s16> GetAudioFrame();
 
+// Read-only accessors for regtest state dumps (no side effects).
+u8 GetStatByte();
+u8 GetIRQFlag();
+u8 GetModeByte();
+u32 GetReadLBA();
+
 } // namespace CDROM

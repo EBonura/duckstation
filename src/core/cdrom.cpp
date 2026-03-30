@@ -4359,3 +4359,23 @@ void CDROM::DrawDebugWindow(float scale)
     ImGui::Text("Audio FIFO Size: %u frames", s_state.audio_fifo.GetSize());
   }
 }
+
+u8 CDROM::GetStatByte()
+{
+  return s_state.secondary_status.bits;
+}
+
+u8 CDROM::GetIRQFlag()
+{
+  return s_state.interrupt_flag_register;
+}
+
+u8 CDROM::GetModeByte()
+{
+  return s_state.mode.bits;
+}
+
+u32 CDROM::GetReadLBA()
+{
+  return s_state.current_lba;
+}

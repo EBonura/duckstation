@@ -3,18 +3,23 @@
 
 #include "core/achievements.h"
 #include "core/bus.h"
+#include "core/cdrom.h"
 #include "core/controller.h"
+#include "core/cpu_core.h"
 #include "core/core_private.h"
 #include "core/cpu_core.h"
+#include "core/dma.h"
 #include "core/fullscreenui.h"
 #include "core/fullscreenui_widgets.h"
 #include "core/game_list.h"
 #include "core/gpu.h"
 #include "core/gpu_backend.h"
 #include "core/host.h"
+#include "core/interrupt_controller.h"
 #include "core/spu.h"
 #include "core/system.h"
 #include "core/system_private.h"
+#include "core/timers.h"
 #include "core/video_presenter.h"
 #include "core/video_thread.h"
 
@@ -57,6 +62,7 @@ static void InitializeEarlyConsole();
 static void HookSignals();
 static bool SetNewDataRoot(const std::string& filename);
 static void DumpSystemStateHashes();
+static void DumpFrameState(u32 frame);
 static std::string GetFrameDumpPath(u32 frame);
 static void ProcessCoreThreadEvents();
 static void VideoThreadEntryPoint();
@@ -79,7 +85,18 @@ static Threading::Thread s_video_thread;
 static u32 s_frames_to_run = 60 * 60;
 static u32 s_frames_remaining = 0;
 static u32 s_frame_dump_interval = 0;
+static u32 s_hash_interval = 0;
+static u32 s_vram_dump_interval = 0;
 static std::string s_dump_base_directory;
+static std::string s_vram_output_path;
+static std::string s_ram_output_path;
+static std::string s_vram_dump_directory;
+static u32 s_ram_dump_interval = 0;
+static std::string s_ram_dump_directory;
+static u32 s_state_dump_interval = 0;
+static std::string s_state_dump_directory;
+static std::string s_insn_trace_path;
+static u32 s_insn_trace_limit = 0;
 
 bool RegTestHost::InitializeFoldersAndConfig(Error* error)
 {
@@ -104,7 +121,7 @@ bool RegTestHost::InitializeFoldersAndConfig(Error* error)
   si.SetBoolValue("Logging", "LogToFile", false);
   si.SetStringValue("Logging", "LogLevel", Settings::GetLogLevelName(Log::Level::Info));
   si.SetBoolValue("Main", "ApplyGameSettings", false); // don't want game settings interfering
-  si.SetBoolValue("BIOS", "PatchFastBoot", true);      // no point validating the bios intro..
+  si.SetBoolValue("BIOS", "PatchFastBoot", false);      // full BIOS boot for accurate comparison
   si.SetFloatValue("Main", "EmulationSpeed", 0.0f);
 
   // disable all sources
@@ -324,9 +341,57 @@ void Host::PumpMessagesOnCoreThread()
   RegTestHost::ProcessCoreThreadEvents();
 
   s_frames_remaining--;
+
+  u32 current_frame = s_frames_to_run - s_frames_remaining;
+
+  // Log cycle count every frame (for timing comparison with other emulators)
+  if (s_hash_interval > 0 && (current_frame % s_hash_interval) == 0)
+  {
+    INFO_LOG("=== Frame {} global_ticks: {} instructions: {} ===",
+      current_frame, System::GetGlobalTickCounter(), CPU::g_state.total_instructions);
+    RegTestHost::DumpSystemStateHashes();
+  }
+
+  // Dump full frame state to binary file at every interval
+  if (s_state_dump_interval > 0 && (current_frame % s_state_dump_interval) == 0)
+  {
+    RegTestHost::DumpFrameState(current_frame);
+  }
+
+  // Dump raw VRAM to binary file at every interval
+  if (s_vram_dump_interval > 0 && (current_frame % s_vram_dump_interval) == 0)
+  {
+    std::string path = Path::Combine(s_vram_dump_directory,
+        fmt::format("vram_{:05d}.bin", current_frame));
+    FILE* fp = FileSystem::OpenCFile(path.c_str(), "wb");
+    if (fp)
+    {
+      std::fwrite(g_vram, sizeof(u16), VRAM_WIDTH * VRAM_HEIGHT, fp);
+      std::fclose(fp);
+    }
+    else
+    {
+      ERROR_LOG("Failed to write VRAM dump: {}", path);
+    }
+  }
+
+  // Dump raw RAM to binary file at every interval
+  if (s_ram_dump_interval > 0 && (current_frame % s_ram_dump_interval) == 0)
+  {
+    std::string path = Path::Combine(s_ram_dump_directory,
+        fmt::format("ram_{:05d}.bin", current_frame));
+    FILE* fp = FileSystem::OpenCFile(path.c_str(), "wb");
+    if (fp)
+    {
+      std::fwrite(Bus::g_ram, 1, Bus::g_ram_size, fp);
+      std::fclose(fp);
+    }
+  }
+
   if (s_frames_remaining == 0)
   {
-    RegTestHost::DumpSystemStateHashes();
+    if (s_hash_interval == 0)
+      RegTestHost::DumpSystemStateHashes();
     System::ShutdownSystem(false);
   }
 }
@@ -741,6 +806,100 @@ void RegTestHost::DumpSystemStateHashes()
                               std::span<const u8>(reinterpret_cast<const u8*>(g_vram), VRAM_SIZE))));
 }
 
+void RegTestHost::DumpFrameState(u32 frame)
+{
+#pragma pack(push, 1)
+  struct FrameState
+  {
+    u32 frame_number;
+    u32 _pad0;
+    u64 global_ticks;
+    u64 instruction_count;
+    u32 gpr[32];
+    u32 pc;
+    u32 hi, lo;
+    u32 sr, cause, epc;
+    u32 gte_data[32];
+    u32 gte_ctrl[32];
+    u32 i_stat, i_mask;
+    u8 cd_stat, cd_irq_flag, cd_mode;
+    u8 _pad1;
+    u32 cd_read_lba;
+    u32 timer_values[3];
+    u32 timer_targets[3];
+    u32 dma_dpcr, dma_dicr;
+    u8 ram_sha256[32];
+    u8 vram_sha256[32];
+  };
+#pragma pack(pop)
+
+  FrameState fs = {};
+  fs.frame_number = frame;
+  fs.global_ticks = System::GetGlobalTickCounter();
+  fs.instruction_count = CPU::g_state.total_instructions;
+
+  // CPU GPRs (first 32 entries of regs.r, which includes hi/lo after index 31)
+  for (u32 i = 0; i < 32; i++)
+    fs.gpr[i] = CPU::g_state.regs.r[i];
+  fs.pc = CPU::g_state.pc;
+  fs.hi = CPU::g_state.regs.hi;
+  fs.lo = CPU::g_state.regs.lo;
+  fs.sr = CPU::g_state.cop0_regs.sr.bits;
+  fs.cause = CPU::g_state.cop0_regs.cause.bits;
+  fs.epc = CPU::g_state.cop0_regs.EPC;
+
+  // GTE registers (stored in CPU state)
+  for (u32 i = 0; i < 32; i++)
+    fs.gte_data[i] = CPU::g_state.gte_regs.dr32[i];
+  for (u32 i = 0; i < 32; i++)
+    fs.gte_ctrl[i] = CPU::g_state.gte_regs.cr32[i];
+
+  // Interrupts (use ReadRegister — no side effects for reads)
+  fs.i_stat = InterruptController::ReadRegister(0x00);
+  fs.i_mask = InterruptController::ReadRegister(0x04);
+
+  // CDROM (use accessors — no side effects)
+  fs.cd_stat = CDROM::GetStatByte();
+  fs.cd_irq_flag = CDROM::GetIRQFlag();
+  fs.cd_mode = CDROM::GetModeByte();
+  fs.cd_read_lba = CDROM::GetReadLBA();
+
+  // Timers — read counter (offset 0x00) and target (offset 0x08) per timer
+  // Note: counter read calls InvokeEarly which is fine at frame boundary
+  for (u32 i = 0; i < 3; i++)
+  {
+    fs.timer_values[i] = Timers::ReadRegister(i * 0x10 + 0x00);
+    fs.timer_targets[i] = Timers::ReadRegister(i * 0x10 + 0x08);
+  }
+
+  // DMA
+  fs.dma_dpcr = DMA::ReadRegister(0x70);
+  fs.dma_dicr = DMA::ReadRegister(0x74);
+
+  // RAM SHA-256
+  const auto ram_digest = SHA256Digest::GetDigest(std::span<const u8>(Bus::g_ram, Bus::g_ram_size));
+  std::memcpy(fs.ram_sha256, ram_digest.data(), 32);
+
+  // VRAM SHA-256
+  const auto vram_digest = SHA256Digest::GetDigest(
+    std::span<const u8>(reinterpret_cast<const u8*>(g_vram), VRAM_SIZE));
+  std::memcpy(fs.vram_sha256, vram_digest.data(), 32);
+
+  // Write binary file
+  std::string path = Path::Combine(s_state_dump_directory,
+      fmt::format("state_{:05d}.bin", frame));
+  FILE* fp = FileSystem::OpenCFile(path.c_str(), "wb");
+  if (fp)
+  {
+    std::fwrite(&fs, sizeof(fs), 1, fp);
+    std::fclose(fp);
+  }
+  else
+  {
+    ERROR_LOG("Failed to write state dump: {}", path);
+  }
+}
+
 void RegTestHost::InitializeEarlyConsole()
 {
   const bool was_console_enabled = Log::IsConsoleOutputEnabled();
@@ -913,6 +1072,76 @@ bool RegTestHost::ParseCommandLineParameters(int argc, char* argv[], std::option
         Core::SetBaseBoolSettingValue("GPU", "PGXPCPU", true);
         continue;
       }
+      else if (CHECK_ARG_PARAM("-vramout"))
+      {
+        s_vram_output_path = argv[++i];
+        continue;
+      }
+      else if (CHECK_ARG_PARAM("-ramout"))
+      {
+        s_ram_output_path = argv[++i];
+        continue;
+      }
+      else if (CHECK_ARG_PARAM("-hashinterval"))
+      {
+        s_hash_interval = StringUtil::FromChars<u32>(argv[++i]).value_or(0);
+        if (s_hash_interval == 0)
+        {
+          ERROR_LOG("Invalid hash interval specified: {}", argv[i]);
+          return false;
+        }
+        continue;
+      }
+      else if (CHECK_ARG_PARAM("-vramdumpinterval"))
+      {
+        s_vram_dump_interval = StringUtil::FromChars<u32>(argv[++i]).value_or(0);
+        if (s_vram_dump_interval == 0)
+        {
+          ERROR_LOG("Invalid VRAM dump interval specified: {}", argv[i]);
+          return false;
+        }
+        continue;
+      }
+      else if (CHECK_ARG_PARAM("-vramdumpdir"))
+      {
+        s_vram_dump_directory = argv[++i];
+        continue;
+      }
+      else if (CHECK_ARG_PARAM("-ramdumpinterval"))
+      {
+        s_ram_dump_interval = StringUtil::FromChars<u32>(argv[++i]).value_or(0);
+        continue;
+      }
+      else if (CHECK_ARG_PARAM("-ramdumpdir"))
+      {
+        s_ram_dump_directory = argv[++i];
+        continue;
+      }
+      else if (CHECK_ARG_PARAM("-statedumpinterval"))
+      {
+        s_state_dump_interval = StringUtil::FromChars<u32>(argv[++i]).value_or(0);
+        if (s_state_dump_interval == 0)
+        {
+          ERROR_LOG("Invalid state dump interval specified: {}", argv[i]);
+          return false;
+        }
+        continue;
+      }
+      else if (CHECK_ARG_PARAM("-statedumpdir"))
+      {
+        s_state_dump_directory = argv[++i];
+        continue;
+      }
+      else if (CHECK_ARG_PARAM("-insntrace"))
+      {
+        s_insn_trace_path = argv[++i];
+        continue;
+      }
+      else if (CHECK_ARG_PARAM("-insntrace-limit"))
+      {
+        s_insn_trace_limit = StringUtil::FromChars<u32>(argv[++i]).value_or(0);
+        continue;
+      }
       else if (CHECK_ARG("--"))
       {
         no_more_args = true;
@@ -1020,6 +1249,10 @@ int main(int argc, char* argv[])
     goto cleanup;
   }
 
+  // Start binary instruction trace if requested.
+  if (!s_insn_trace_path.empty())
+    CPU::StartBinaryTrace(s_insn_trace_path.c_str(), s_insn_trace_limit);
+
   if (System::IsReplayingGPUDump() && !s_dump_base_directory.empty())
   {
     INFO_LOG("Replaying GPU dump, dumping all frames.");
@@ -1057,6 +1290,8 @@ int main(int argc, char* argv[])
   result = 0;
 
 cleanup:
+  CPU::StopBinaryTrace();
+
   if (s_video_thread.Joinable())
   {
     VideoThread::Internal::RequestShutdown();

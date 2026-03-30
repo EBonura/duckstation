@@ -29,6 +29,11 @@
 
 LOG_CHANNEL(CPU);
 
+// Binary instruction trace for parity testing with PSoXide.
+static std::FILE* s_binary_trace_file = nullptr;
+static uint32_t s_binary_trace_limit = 0;
+static uint32_t s_binary_trace_count = 0;
+
 namespace CPU {
 enum class ExecutionBreakType
 {
@@ -152,6 +157,27 @@ void CPU::StopTrace()
   s_locals.trace_to_log = false;
   if (UpdateDebugDispatcherFlag())
     System::InterruptExecution();
+}
+
+void CPU::StartBinaryTrace(const char* path, uint32_t limit)
+{
+  s_binary_trace_file = std::fopen(path, "wb");
+  s_binary_trace_limit = limit;
+  s_binary_trace_count = 0;
+  if (s_binary_trace_file)
+    INFO_LOG("Binary instruction trace started: {}", path);
+  else
+    ERROR_LOG("Failed to open binary trace file: {}", path);
+}
+
+void CPU::StopBinaryTrace()
+{
+  if (s_binary_trace_file)
+  {
+    INFO_LOG("Binary instruction trace stopped after {} entries", s_binary_trace_count);
+    std::fclose(s_binary_trace_file);
+    s_binary_trace_file = nullptr;
+  }
 }
 
 void CPU::WriteToExecutionLog(const char* format, ...)
@@ -2517,7 +2543,10 @@ template<PGXPMode pgxp_mode, bool debug>
       if constexpr (debug)
         ExecutionBreakpointCheck(g_state.pc);
 
+      const u32 pre_ticks = g_state.pending_ticks; // for binary trace
+
       g_state.pending_ticks++;
+      g_state.total_instructions++;
 
       // now executing the instruction we previously fetched
       g_state.current_instruction.bits = g_state.next_instruction.bits;
@@ -2564,6 +2593,19 @@ template<PGXPMode pgxp_mode, bool debug>
 
       // next load delay
       UpdateLoadDelay();
+
+      // Binary instruction trace (pc, instruction, per-instruction ticks)
+      if (s_binary_trace_file) [[unlikely]]
+      {
+        struct { u32 pc; u32 insn; u32 ticks; } entry = {
+          g_state.current_instruction_pc,
+          g_state.current_instruction.bits,
+          g_state.pending_ticks - pre_ticks
+        };
+        std::fwrite(&entry, sizeof(entry), 1, s_binary_trace_file);
+        if (++s_binary_trace_count == s_binary_trace_limit && s_binary_trace_limit > 0)
+          StopBinaryTrace();
+      }
 
       if constexpr (debug)
       {
@@ -2655,6 +2697,7 @@ void CPU::CodeCache::InterpretCachedBlock(const Block* block)
   do
   {
     g_state.pending_ticks++;
+    g_state.total_instructions++;
 
     // now executing the instruction we previously fetched
     g_state.current_instruction.bits = instruction->bits;
@@ -2703,6 +2746,7 @@ void CPU::CodeCache::InterpretUncachedBlock()
   for (;;)
   {
     g_state.pending_ticks++;
+    g_state.total_instructions++;
 
     // now executing the instruction we previously fetched
     g_state.current_instruction.bits = g_state.next_instruction.bits;
