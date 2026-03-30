@@ -601,6 +601,10 @@ bool DMA::TransferChannel()
 
       DEBUG_LOG("DMA[{}]: Copying linked list starting at 0x{:08X} to device", channel, current_address);
 
+      // DMA trace marker: linked-list slice start
+      CPU::WriteBinaryTraceEvent(2, static_cast<u32>(
+        TimingEvents::GetGlobalTickCounter() + CPU::GetPendingTicks()));
+
       // Prove to the compiler that nothing's going to modify these.
       const u8* const ram_ptr = Bus::g_ram;
       const u32 mask = Bus::g_ram_mask;
@@ -647,6 +651,9 @@ bool DMA::TransferChannel()
         {
           // Terminator is 24 bits, so is MADR, so it'll always be 0xFFFFFF.
           cs.base_address = LINKED_LIST_TERMINATOR;
+          // DMA trace marker: linked-list complete
+          CPU::WriteBinaryTraceEvent(4, static_cast<u32>(
+            TimingEvents::GetGlobalTickCounter() + CPU::GetPendingTicks()));
           CompleteTransfer(channel, cs);
           return true;
         }
@@ -655,6 +662,9 @@ bool DMA::TransferChannel()
       cs.base_address = current_address;
       if (cs.request)
       {
+        // DMA trace marker: linked-list slice halt
+        CPU::WriteBinaryTraceEvent(3, static_cast<u32>(
+          TimingEvents::GetGlobalTickCounter() + CPU::GetPendingTicks()));
         // stall the transfer for a bit if we ran for too long
         HaltTransfer(g_settings.dma_halt_ticks);
         return false;
@@ -762,6 +772,9 @@ void DMA::HaltTransfer(TickCount duration)
 
 void DMA::UnhaltTransfer(void*, TickCount ticks, TickCount ticks_late)
 {
+  // DMA trace marker: unhalt/resume
+  CPU::WriteBinaryTraceEvent(5, static_cast<u32>(
+    TimingEvents::GetGlobalTickCounter() + CPU::GetPendingTicks()));
   DEBUG_LOG("Resuming DMA after {} ticks, {} ticks late", ticks, -(s_state.halt_ticks_remaining - ticks));
   s_state.halt_ticks_remaining -= ticks;
   s_state.unhalt_event.Deactivate();
