@@ -601,6 +601,18 @@ bool DMA::TransferChannel()
 
       DEBUG_LOG("DMA[{}]: Copying linked list starting at 0x{:08X} to device", channel, current_address);
 
+      {
+        FILE* f = fopen("/tmp/ds_dma_direct.log", "a");
+        if (f) {
+          fprintf(f, "DS DMA%d START: timestamp=%lld global=%lld pending=%d\n",
+            (int)channel,
+            (long long)(TimingEvents::GetGlobalTickCounter() + CPU::g_state.pending_ticks),
+            (long long)TimingEvents::GetGlobalTickCounter(),
+            (int)CPU::g_state.pending_ticks);
+          fclose(f);
+        }
+      }
+
       // DMA trace marker: linked-list slice start
       CPU::WriteBinaryTraceEvent(2, static_cast<u32>(
         TimingEvents::GetGlobalTickCounter() + CPU::GetPendingTicks()));

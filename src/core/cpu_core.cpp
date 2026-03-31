@@ -7,6 +7,8 @@
 #include "cpu_core_private.h"
 #include "cpu_disasm.h"
 #include "cpu_pgxp.h"
+#include "dma.h"
+#include "gpu.h"
 #include "gte.h"
 #include "host.h"
 #include "interrupt_controller.h"
@@ -125,6 +127,12 @@ struct Locals
 ALIGN_TO_CACHE_LINE constinit State g_state;
 ALIGN_TO_CACHE_LINE static Locals s_locals;
 
+// MMIO trace capture for extended parity testing
+static u32 s_last_mmio_read_addr = 0;
+static u32 s_last_mmio_read_value = 0;
+static u32 s_last_mmio_write_addr = 0;
+static u32 s_last_mmio_write_value = 0;
+
 #ifdef _DEBUG
 static bool TRACE_EXECUTION = false;
 #endif
@@ -185,13 +193,22 @@ void CPU::WriteBinaryTraceEvent(u32 event_type, u32 tick_value)
 {
   if (!s_binary_trace_file)
     return;
-  // Pad to 168 bytes with zeros, sentinel in first field
-  u8 buf[168] = {};
+  // Pad to 208 bytes with zeros, sentinel in first field
+  u8 buf[208] = {};
   u32 sentinel = 0xFFFFFFFF;
   std::memcpy(buf, &sentinel, 4);       // gpr[0] = sentinel
   std::memcpy(buf + 4, &tick_value, 4); // gpr[1] = tick
   std::memcpy(buf + 8, &event_type, 4); // gpr[2] = type
   std::fwrite(buf, sizeof(buf), 1, s_binary_trace_file);
+
+  // On VBlank marker, also dump full RAM and VRAM inline for streaming comparison.
+  // Reader expects: 208-byte marker, then 2MB RAM, then 1MB VRAM (raw bytes).
+  if (event_type == 1)
+  {
+    std::fwrite(Bus::g_ram, 1, Bus::g_ram_size, s_binary_trace_file);
+    std::fwrite(g_vram, sizeof(u16), 1024 * 512, s_binary_trace_file);
+    std::fflush(s_binary_trace_file);
+  }
 }
 
 void CPU::WriteToExecutionLog(const char* format, ...)
@@ -2576,6 +2593,12 @@ template<PGXPMode pgxp_mode, bool debug>
           continue;
       }
 
+      // Reset MMIO trace capture for this instruction
+      s_last_mmio_read_addr = 0;
+      s_last_mmio_read_value = 0;
+      s_last_mmio_write_addr = 0;
+      s_last_mmio_write_value = 0;
+
       // fetch the next instruction - even if this fails, it'll still refetch on the flush so we can continue
       if (!FetchInstruction())
         continue;
@@ -2602,6 +2625,14 @@ template<PGXPMode pgxp_mode, bool debug>
     }
 #endif
 
+      // Debug: check RAM[0] at instruction 1516
+      if (g_state.total_instructions == 1516 && s_binary_trace_file) {
+        u32 ram0;
+        std::memcpy(&ram0, &Bus::g_ram[0], sizeof(u32));
+        std::fprintf(stderr, "[DS_DEBUG] insn=%llu pc=%08X RAM[0]=%08X ram_mask=%08X\n",
+            g_state.total_instructions, g_state.current_instruction_pc, ram0, Bus::g_ram_mask);
+      }
+
       // execute the instruction we previously fetched
       ExecuteInstruction<pgxp_mode, debug>();
 
@@ -2618,9 +2649,15 @@ template<PGXPMode pgxp_mode, bool debug>
           u32 sr, cause, epc;
           u16 i_stat, i_mask;
           u32 ticks, pending, insn;
+          u32 mmio_read_addr, mmio_read_value;
+          u32 mmio_write_addr, mmio_write_value;
+          u32 gpustat;
+          u32 dma_dpcr, dma_dicr;
+          u64 global_ticks;
+          u32 pad;
         };
 #pragma pack(pop)
-        static_assert(sizeof(TraceEntry) == 168, "TraceEntry must be exactly 168 bytes");
+        static_assert(sizeof(TraceEntry) == 208, "TraceEntry must be exactly 208 bytes");
         TraceEntry entry;
 
         // GPRs — snapshot AFTER UpdateLoadDelay
@@ -2637,6 +2674,15 @@ template<PGXPMode pgxp_mode, bool debug>
         entry.ticks = g_state.pending_ticks - pre_ticks;
         entry.pending = g_state.pending_ticks;
         entry.insn = g_state.current_instruction.bits;
+        entry.mmio_read_addr = s_last_mmio_read_addr;
+        entry.mmio_read_value = s_last_mmio_read_value;
+        entry.mmio_write_addr = s_last_mmio_write_addr;
+        entry.mmio_write_value = s_last_mmio_write_value;
+        entry.gpustat = g_gpu.GetRawGPUSTAT();
+        entry.dma_dpcr = DMA::ReadRegister(0x70);
+        entry.dma_dicr = DMA::ReadRegister(0x74);
+        entry.global_ticks = static_cast<u64>(TimingEvents::GetGlobalTickCounter());
+        entry.pad = 0;
 
         std::fwrite(&entry, sizeof(entry), 1, s_binary_trace_file);
         if (++s_binary_trace_count == s_binary_trace_limit && s_binary_trace_limit > 0)
@@ -3619,6 +3665,13 @@ bool CPU::ReadMemoryByte(VirtualMemoryAddress addr, u8* value)
   }
 
   MEMORY_BREAKPOINT(MemoryAccessType::Read, MemoryAccessSize::Byte, addr, *value);
+  if (s_binary_trace_file) {
+    const u32 phys = addr & 0x1FFFFFFF;
+    if (phys >= 0x1F801000 && phys < 0x1F803000) {
+      s_last_mmio_read_addr = phys;
+      s_last_mmio_read_value = *value;
+    }
+  }
   return true;
 }
 
@@ -3636,6 +3689,13 @@ bool CPU::ReadMemoryHalfWord(VirtualMemoryAddress addr, u16* value)
   }
 
   MEMORY_BREAKPOINT(MemoryAccessType::Read, MemoryAccessSize::HalfWord, addr, *value);
+  if (s_binary_trace_file) {
+    const u32 phys = addr & 0x1FFFFFFF;
+    if (phys >= 0x1F801000 && phys < 0x1F803000) {
+      s_last_mmio_read_addr = phys;
+      s_last_mmio_read_value = *value;
+    }
+  }
   return true;
 }
 
@@ -3653,6 +3713,13 @@ bool CPU::ReadMemoryWord(VirtualMemoryAddress addr, u32* value)
   }
 
   MEMORY_BREAKPOINT(MemoryAccessType::Read, MemoryAccessSize::Word, addr, *value);
+  if (s_binary_trace_file) {
+    const u32 phys = addr & 0x1FFFFFFF;
+    if (phys >= 0x1F801000 && phys < 0x1F803000) {
+      s_last_mmio_read_addr = phys;
+      s_last_mmio_read_value = *value;
+    }
+  }
   return true;
 }
 
@@ -3668,6 +3735,13 @@ bool CPU::WriteMemoryByte(VirtualMemoryAddress addr, u32 value)
     return false;
   }
 
+  if (s_binary_trace_file) {
+    const u32 phys = addr & 0x1FFFFFFF;
+    if (phys >= 0x1F801000 && phys < 0x1F803000) {
+      s_last_mmio_write_addr = phys;
+      s_last_mmio_write_value = value;
+    }
+  }
   return true;
 }
 
@@ -3686,6 +3760,13 @@ bool CPU::WriteMemoryHalfWord(VirtualMemoryAddress addr, u32 value)
     return false;
   }
 
+  if (s_binary_trace_file) {
+    const u32 phys = addr & 0x1FFFFFFF;
+    if (phys >= 0x1F801000 && phys < 0x1F803000) {
+      s_last_mmio_write_addr = phys;
+      s_last_mmio_write_value = value;
+    }
+  }
   return true;
 }
 
@@ -3704,6 +3785,13 @@ bool CPU::WriteMemoryWord(VirtualMemoryAddress addr, u32 value)
     return false;
   }
 
+  if (s_binary_trace_file) {
+    const u32 phys = addr & 0x1FFFFFFF;
+    if (phys >= 0x1F801000 && phys < 0x1F803000) {
+      s_last_mmio_write_addr = phys;
+      s_last_mmio_write_value = value;
+    }
+  }
   return true;
 }
 

@@ -117,6 +117,9 @@ public:
   // DMA access
   void DMARead(u32* words, u32 word_count);
 
+  // Raw GPUSTAT bits without side effects (for trace capture)
+  ALWAYS_INLINE u32 GetRawGPUSTAT() const { return m_GPUSTAT.bits; }
+
   ALWAYS_INLINE bool BeginDMAWrite() const
   {
     return (m_GPUSTAT.dma_direction == GPUDMADirection::CPUtoGP0 || m_GPUSTAT.dma_direction == GPUDMADirection::FIFO);
