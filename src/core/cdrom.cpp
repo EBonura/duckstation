@@ -1139,7 +1139,7 @@ u8 CDROM::ReadRegister(u32 offset)
     default:
       [[unlikely]]
       {
-        ERROR_LOG("Unknown CDROM register read: offset=0x{:02X}, index={}", offset,
+        DEBUG_LOG("Unknown CDROM register read: offset=0x{:02X}, index={}", offset,
                   ZeroExtend32(s_state.status.index.GetValue()));
         return 0;
       }

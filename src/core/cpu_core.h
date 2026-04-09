@@ -11,6 +11,7 @@
 
 #include <array>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -212,7 +213,10 @@ void StopTrace();
 
 // Binary instruction trace (for parity testing with PSoXide).
 void StartBinaryTrace(const char* path, uint32_t limit = 0);
+void StartBinaryTraceToMemory(uint32_t limit = 0, bool stop_on_limit = false);
 void StopBinaryTrace();
+std::span<const u8> GetBinaryTraceMemoryBuffer();
+u32 GetBinaryTraceCount();
 
 // Write an event marker to the binary trace (e.g. VBlank).
 // Marker format: pc=0xFFFFFFFF, insn=tick_value, ticks=event_type.

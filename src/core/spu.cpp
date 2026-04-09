@@ -1655,6 +1655,38 @@ std::array<u8, SPU::RAM_SIZE>& SPU::GetWritableRAM()
   return s_ram;
 }
 
+SPU::TraceState SPU::GetTraceState()
+{
+  TraceState ts;
+  ts.main_vol_left = s_state.main_volume_left.current_level;
+  ts.main_vol_right = s_state.main_volume_right.current_level;
+  ts.spustat = s_state.SPUSTAT.bits;
+  ts.endx = s_state.endx_register;
+  ts.noise_level = s_state.noise_level;
+
+  // CRC32 over compact per-voice state for quick comparison.
+  u32 hash = 0;
+  for (u32 i = 0; i < NUM_VOICES; i++)
+  {
+    const Voice& v = s_state.voices[i];
+    // Hash: is_on, current_address, adsr_volume, adsr_phase, pitch
+    u32 voice_data[4];
+    voice_data[0] = (v.IsOn() ? 1u : 0u) | (static_cast<u32>(v.adsr_phase) << 8);
+    voice_data[1] = v.current_address;
+    voice_data[2] = static_cast<u32>(static_cast<u16>(v.regs.adsr_volume));
+    voice_data[3] = v.regs.adpcm_sample_rate;
+    // Simple hash: rotate and xor
+    for (u32 j = 0; j < 4; j++)
+    {
+      hash ^= voice_data[j];
+      hash = (hash << 7) | (hash >> 25);
+    }
+  }
+  ts.voice_hash = hash;
+
+  return ts;
+}
+
 bool SPU::IsAudioOutputMuted()
 {
   return s_state.audio_output_muted;

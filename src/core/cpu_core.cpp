@@ -15,8 +15,10 @@
 #include "pcdrv.h"
 #include "pio.h"
 #include "settings.h"
+#include "spu.h"
 #include "system.h"
 #include "timing_event.h"
+#include "video_thread.h"
 
 #include "util/state_wrapper.h"
 
@@ -36,6 +38,27 @@ LOG_CHANNEL(CPU);
 static std::FILE* s_binary_trace_file = nullptr;
 static uint32_t s_binary_trace_limit = 0;
 static uint32_t s_binary_trace_count = 0;
+static bool s_binary_trace_memory_mode = false;
+static bool s_binary_trace_break_on_limit = false;
+static std::vector<u8> s_binary_trace_buffer;
+
+static bool HasActiveBinaryTraceSink()
+{
+  return (s_binary_trace_file != nullptr) || s_binary_trace_memory_mode;
+}
+
+static void AppendBinaryTraceBytes(const void* data, size_t size)
+{
+  if (s_binary_trace_memory_mode)
+  {
+    const auto* bytes = static_cast<const u8*>(data);
+    s_binary_trace_buffer.insert(s_binary_trace_buffer.end(), bytes, bytes + size);
+    return;
+  }
+
+  if (s_binary_trace_file)
+    std::fwrite(data, size, 1, s_binary_trace_file);
+}
 
 namespace CPU {
 enum class ExecutionBreakType
@@ -170,7 +193,11 @@ void CPU::StopTrace()
 
 void CPU::StartBinaryTrace(const char* path, uint32_t limit)
 {
+  StopBinaryTrace();
   s_binary_trace_file = std::fopen(path, "wb");
+  s_binary_trace_memory_mode = false;
+  s_binary_trace_break_on_limit = false;
+  s_binary_trace_buffer.clear();
   s_binary_trace_limit = limit;
   s_binary_trace_count = 0;
   if (s_binary_trace_file)
@@ -179,35 +206,78 @@ void CPU::StartBinaryTrace(const char* path, uint32_t limit)
     ERROR_LOG("Failed to open binary trace file: {}", path);
 }
 
+void CPU::StartBinaryTraceToMemory(uint32_t limit, bool stop_on_limit)
+{
+  StopBinaryTrace();
+  s_binary_trace_file = nullptr;
+  s_binary_trace_memory_mode = true;
+  s_binary_trace_break_on_limit = stop_on_limit;
+  s_binary_trace_limit = limit;
+  s_binary_trace_count = 0;
+  s_binary_trace_buffer.clear();
+  if (limit > 0)
+    s_binary_trace_buffer.reserve(static_cast<size_t>(limit) * 256);
+  INFO_LOG("Binary instruction trace started in memory (limit={}, break_on_limit={})", limit, stop_on_limit);
+}
+
 void CPU::StopBinaryTrace()
 {
-  if (s_binary_trace_file)
+  if (s_binary_trace_file || s_binary_trace_memory_mode)
   {
     INFO_LOG("Binary instruction trace stopped after {} entries", s_binary_trace_count);
-    std::fclose(s_binary_trace_file);
-    s_binary_trace_file = nullptr;
+    if (s_binary_trace_file)
+    {
+      std::fclose(s_binary_trace_file);
+      s_binary_trace_file = nullptr;
+    }
   }
+
+  s_binary_trace_memory_mode = false;
+  s_binary_trace_break_on_limit = false;
+}
+
+std::span<const u8> CPU::GetBinaryTraceMemoryBuffer()
+{
+  return std::span<const u8>(s_binary_trace_buffer.data(), s_binary_trace_buffer.size());
+}
+
+u32 CPU::GetBinaryTraceCount()
+{
+  return s_binary_trace_count;
 }
 
 void CPU::WriteBinaryTraceEvent(u32 event_type, u32 tick_value)
 {
-  if (!s_binary_trace_file)
+  if (!HasActiveBinaryTraceSink())
     return;
-  // Pad to 208 bytes with zeros, sentinel in first field
-  u8 buf[208] = {};
+
+  // Keep memory-backed traces as fixed-size per-instruction streams for the
+  // bridge. Event markers and inline RAM/VRAM dumps are only retained for the
+  // legacy file-backed streaming trace format.
+  if (s_binary_trace_memory_mode)
+    return;
+
+  // Pad to 256 bytes with zeros, sentinel in first field.
+  u8 buf[256] = {};
   u32 sentinel = 0xFFFFFFFF;
   std::memcpy(buf, &sentinel, 4);       // gpr[0] = sentinel
   std::memcpy(buf + 4, &tick_value, 4); // gpr[1] = tick
   std::memcpy(buf + 8, &event_type, 4); // gpr[2] = type
-  std::fwrite(buf, sizeof(buf), 1, s_binary_trace_file);
+  AppendBinaryTraceBytes(buf, sizeof(buf));
 
-  // On VBlank marker, also dump full RAM and VRAM inline for streaming comparison.
-  // Reader expects: 208-byte marker, then 2MB RAM, then 1MB VRAM (raw bytes).
+  // On VBlank marker, also dump full RAM and VRAM inline for the legacy
+  // file-backed streaming comparison format.
   if (event_type == 1)
   {
-    std::fwrite(Bus::g_ram, 1, Bus::g_ram_size, s_binary_trace_file);
-    std::fwrite(g_vram, sizeof(u16), 1024 * 512, s_binary_trace_file);
-    std::fflush(s_binary_trace_file);
+    // Sync the video thread so all queued GPU draw commands are flushed to
+    // g_vram before we dump it. Without this, VRAM is empty because
+    // rasterization happens on the backend thread asynchronously.
+    VideoThread::SyncThread(true);
+
+    AppendBinaryTraceBytes(Bus::g_ram, Bus::g_ram_size);
+    AppendBinaryTraceBytes(g_vram, sizeof(u16) * 1024 * 512);
+    if (s_binary_trace_file)
+      std::fflush(s_binary_trace_file);
   }
 }
 
@@ -2644,6 +2714,7 @@ template<PGXPMode pgxp_mode, bool debug>
       {
 #pragma pack(push, 1)
         struct TraceEntry {
+          // v1 fields (208 bytes)
           u32 gpr[32];
           u32 pc, hi, lo;
           u32 sr, cause, epc;
@@ -2655,9 +2726,23 @@ template<PGXPMode pgxp_mode, bool debug>
           u32 dma_dpcr, dma_dicr;
           u64 global_ticks;
           u32 pad;
+          // v2 extension (48 bytes, total = 256)
+          u32 format_version;    // 0x50533032 = "PS02"
+          u64 ram_dirty;
+          u64 vram_dirty;
+          s16 spu_main_vol_left;
+          s16 spu_main_vol_right;
+          u32 spu_status;
+          u32 spu_endx;
+          u32 spu_voice_hash;
+          u32 spu_noise_level;
+          u16 gpu_scanline;
+          u16 gpu_tick_in_scanline;
+          u16 gpu_display_y;
+          u16 gpu_beam_line;
         };
 #pragma pack(pop)
-        static_assert(sizeof(TraceEntry) == 208, "TraceEntry must be exactly 208 bytes");
+        static_assert(sizeof(TraceEntry) == 256, "TraceEntry must be exactly 256 bytes");
         TraceEntry entry;
 
         // GPRs — snapshot AFTER UpdateLoadDelay
@@ -2684,9 +2769,38 @@ template<PGXPMode pgxp_mode, bool debug>
         entry.global_ticks = static_cast<u64>(TimingEvents::GetGlobalTickCounter());
         entry.pad = 0;
 
-        std::fwrite(&entry, sizeof(entry), 1, s_binary_trace_file);
+        // v2 extension fields
+        entry.format_version = 0x50533032; // "PS02"
+        entry.ram_dirty = Bus::GetAndClearRAMDirty();
+        entry.vram_dirty = g_gpu.GetAndClearVRAMDirty();
+        {
+          SPU::TraceState spu_ts = SPU::GetTraceState();
+          entry.spu_main_vol_left = spu_ts.main_vol_left;
+          entry.spu_main_vol_right = spu_ts.main_vol_right;
+          entry.spu_status = spu_ts.spustat;
+          entry.spu_endx = spu_ts.endx;
+          entry.spu_voice_hash = spu_ts.voice_hash;
+          entry.spu_noise_level = spu_ts.noise_level;
+        }
+        u32 trace_beam_tick = 0;
+        u32 trace_beam_line = 0;
+        g_gpu.GetBeamPosition(&trace_beam_tick, &trace_beam_line);
+        entry.gpu_scanline = g_gpu.GetTraceStoredScanline();
+        entry.gpu_tick_in_scanline = g_gpu.GetTraceStoredTickInScanline();
+        entry.gpu_display_y = g_gpu.GetTraceDisplayY();
+        entry.gpu_beam_line = static_cast<u16>(trace_beam_line);
+
+        AppendBinaryTraceBytes(&entry, sizeof(entry));
         if (++s_binary_trace_count == s_binary_trace_limit && s_binary_trace_limit > 0)
+        {
+          const bool break_on_limit = s_binary_trace_break_on_limit;
           StopBinaryTrace();
+          if (break_on_limit)
+          {
+            System::PauseSystem(true);
+            ExitExecution();
+          }
+        }
       }
 
       if constexpr (debug)
