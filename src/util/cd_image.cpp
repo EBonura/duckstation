@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #include "cd_image.h"
+#include "bridge_memory_registry.h"
 
 #include "common/assert.h"
 #include "common/bcdutils.h"
@@ -11,6 +12,8 @@
 #include "common/log.h"
 #include "common/path.h"
 #include "common/string_util.h"
+
+#include "fmt/format.h"
 
 #include <array>
 
@@ -53,6 +56,33 @@ void CDImage::DeinterleaveSubcode(const u8* subcode_in, u8* subcode_out)
 
 std::unique_ptr<CDImage> CDImage::Open(const char* path, bool allow_patches, Error* error)
 {
+  if (BridgeMemoryRegistry::IsRegisteredURI(path))
+  {
+    std::string format = BridgeMemoryRegistry::LookupDiscFormat(path);
+    std::string name = fmt::format("bridge-disc.{}", format.empty() ? "bin" : format.c_str());
+    if (StringUtil::EqualNoCase(format, "cue"))
+    {
+      std::string cue_text = BridgeMemoryRegistry::LookupCueDiscText(path);
+      if (cue_text.empty())
+      {
+        Error::SetStringFmt(error, "Bridge cue URI '{}' is registered but empty", path);
+        return nullptr;
+      }
+      auto files = BridgeMemoryRegistry::LookupCueDiscFiles(path);
+      return OpenMemoryCueImage(name, std::move(cue_text), std::move(files), error);
+    }
+
+    auto blob = BridgeMemoryRegistry::LookupDisc(path);
+    if (blob.empty())
+    {
+      Error::SetStringFmt(error, "Bridge disc URI '{}' is registered but empty", path);
+      return nullptr;
+    }
+
+    std::vector<u8> data(blob.begin(), blob.end());
+    return OpenMemoryBinImage(name, std::move(data), error);
+  }
+
   // Annoying handling because of storage access framework.
 #ifdef __ANDROID__
   const std::string path_display_name = FileSystem::GetDisplayNameFromPath(path);

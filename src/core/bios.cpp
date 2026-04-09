@@ -7,6 +7,7 @@
 #include "mips_encoder.h"
 #include "settings.h"
 
+#include "util/bridge_memory_registry.h"
 #include "util/translation.h"
 
 #include "common/assert.h"
@@ -182,6 +183,30 @@ TinyString BIOS::ImageInfo::GetHashString(const BIOS::ImageInfo::Hash& hash)
 std::optional<BIOS::Image> BIOS::LoadImageFromFile(const char* filename, Error* error)
 {
   std::optional<BIOS::Image> ret;
+
+  if (BridgeMemoryRegistry::IsRegisteredURI(filename))
+  {
+    auto blob = BridgeMemoryRegistry::LookupBios(filename);
+    if (blob.empty())
+    {
+      Error::SetStringFmt(error, "Bridge BIOS URI '{}' is registered but empty", filename);
+      return ret;
+    }
+    if (blob.size() < BIOS_SIZE)
+    {
+      Error::SetStringFmt(error, "Bridge BIOS URI '{}' too small: {} bytes", filename, blob.size());
+      return ret;
+    }
+    ret = BIOS::Image();
+    DynamicHeapArray<u8> data;
+    data.resize(blob.size());
+    std::memcpy(data.data(), blob.data(), blob.size());
+    ret->hash = MD5Digest::HashData(data);
+    ret->data = std::move(data);
+    ret->data.resize(BIOS_SIZE);
+    ret->info = GetInfoForHash(ret->data, ret->hash);
+    return ret;
+  }
 
   auto fp = FileSystem::OpenManagedCFile(filename, "rb", error);
   if (!fp)
@@ -373,6 +398,11 @@ std::optional<BIOS::Image> BIOS::GetBIOSImage(ConsoleRegion region, Error* error
   {
     // auto-detect
     image = FindBIOSImageInDirectory(region, EmuFolders::Bios.c_str(), error);
+  }
+  else if (BridgeMemoryRegistry::IsRegisteredURI(bios_name.c_str()))
+  {
+    // bridge in-memory BIOS — pass URI directly, bypass directory combine
+    image = LoadImageFromFile(bios_name.c_str(), error);
   }
   else
   {

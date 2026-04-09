@@ -3,6 +3,8 @@ add_library(util
   animated_image.h
   audio_stream.cpp
   audio_stream.h
+  bridge_memory_registry.cpp
+  bridge_memory_registry.h
   cd_image.cpp
   cd_image.h
   cd_image_ccd.cpp

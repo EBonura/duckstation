@@ -135,6 +135,21 @@ private:
   WAVReader m_reader;
 };
 
+class MemoryTrackFileInterface final : public TrackFileInterface
+{
+public:
+  MemoryTrackFileInterface(std::string filename, std::vector<u8> data);
+  ~MemoryTrackFileInterface() override;
+
+  u64 GetSize() override;
+  u64 GetDiskSize() override;
+
+  bool Read(void* buffer, u64 offset, u32 size, Error* error) override;
+
+private:
+  std::vector<u8> m_data;
+};
+
 class CDImageCueSheet : public CDImage
 {
 public:
@@ -142,7 +157,10 @@ public:
   ~CDImageCueSheet() override;
 
   bool OpenAndParseCueSheet(const char* path, Error* error);
+  bool OpenAndParseCueSheetFromMemory(const std::string& name, std::string cue_text,
+                                      std::vector<std::pair<std::string, std::vector<u8>>> files, Error* error);
   bool OpenAndParseSingleFile(const char* path, Error* error);
+  bool OpenFromMemory(const std::string& name, std::vector<u8> data, Error* error);
 
   s64 GetSizeOnDisk() const override;
 
@@ -152,6 +170,17 @@ protected:
 private:
   std::vector<std::unique_ptr<TrackFileInterface>> m_files;
 };
+
+std::vector<u8>* FindMemoryCueFile(std::vector<std::pair<std::string, std::vector<u8>>>& files,
+                                   const std::string& filename)
+{
+  for (auto& [candidate, data] : files)
+  {
+    if (candidate == filename)
+      return &data;
+  }
+  return nullptr;
+}
 
 } // namespace
 
@@ -550,6 +579,37 @@ u64 WaveTrackFileInterface::GetDiskSize()
   return m_reader.GetFileSize();
 }
 
+MemoryTrackFileInterface::MemoryTrackFileInterface(std::string filename, std::vector<u8> data)
+  : TrackFileInterface(std::move(filename)), m_data(std::move(data))
+{
+}
+
+MemoryTrackFileInterface::~MemoryTrackFileInterface() = default;
+
+u64 MemoryTrackFileInterface::GetSize()
+{
+  return m_data.size();
+}
+
+u64 MemoryTrackFileInterface::GetDiskSize()
+{
+  return 0; // in-memory, no disk footprint
+}
+
+bool MemoryTrackFileInterface::Read(void* buffer, u64 offset, u32 size, Error* error)
+{
+  if (offset + size > m_data.size())
+  {
+    Error::SetStringFmt(error, "Memory track read out of bounds: offset={}, size={}, total={}",
+                        offset, size, m_data.size());
+    return false;
+  }
+  std::memcpy(buffer, m_data.data() + offset, size);
+  return true;
+}
+
+//////////////////////////////////////////////////////////////////////////
+
 CDImageCueSheet::CDImageCueSheet() = default;
 
 CDImageCueSheet::~CDImageCueSheet() = default;
@@ -811,6 +871,210 @@ bool CDImageCueSheet::OpenAndParseCueSheet(const char* path, Error* error)
   return Seek(1, Position{0, 0, 0});
 }
 
+bool CDImageCueSheet::OpenAndParseCueSheetFromMemory(
+  const std::string& name, std::string cue_text, std::vector<std::pair<std::string, std::vector<u8>>> files,
+  Error* error)
+{
+  CueParser::File parser;
+  if (!parser.Parse(cue_text, error))
+    return false;
+
+  m_filename = name;
+
+  u32 disc_lba = 0;
+
+  for (u32 track_num = 1; track_num <= CueParser::MAX_TRACK_NUMBER; track_num++)
+  {
+    const CueParser::Track* track = parser.GetTrack(track_num);
+    if (!track)
+      break;
+
+    const std::string& track_filename = track->file;
+    LBA track_start = track->start.ToLBA();
+
+    u32 track_file_index = 0;
+    for (; track_file_index < m_files.size(); track_file_index++)
+    {
+      if (m_files[track_file_index]->GetFileName() == track_filename)
+        break;
+    }
+    if (track_file_index == m_files.size())
+    {
+      std::unique_ptr<TrackFileInterface> track_file;
+
+      if (track->file_format == CueParser::FileFormat::Binary)
+      {
+        std::vector<u8>* track_data = FindMemoryCueFile(files, track_filename);
+        if (!track_data)
+        {
+          Error::SetStringFmt(error, "Missing in-memory cue track '{}'", track_filename);
+          return false;
+        }
+
+        track_file = std::make_unique<MemoryTrackFileInterface>(track_filename, std::move(*track_data));
+      }
+      else if (track->file_format == CueParser::FileFormat::Wave)
+      {
+        Error::SetStringFmt(error, "In-memory cue loading does not support WAVE track '{}'", track_filename);
+        return false;
+      }
+
+      if (!track_file)
+        return false;
+
+      m_files.push_back(std::move(track_file));
+    }
+
+    const TrackMode mode = track->mode;
+    const u32 track_sector_size = GetBytesPerSector(mode);
+
+    SubChannelQ::Control control{};
+    control.data = mode != TrackMode::Audio;
+    control.audio_preemphasis = track->HasFlag(CueParser::TrackFlag::PreEmphasis);
+    control.digital_copy_permitted = track->HasFlag(CueParser::TrackFlag::CopyPermitted);
+    control.four_channel_audio = track->HasFlag(CueParser::TrackFlag::FourChannelAudio);
+
+    LBA track_length;
+    if (!track->length.has_value())
+    {
+      u64 file_size = m_files[track_file_index]->GetSize();
+
+      file_size /= track_sector_size;
+      if (track_start >= file_size)
+      {
+        ERROR_LOG("Failed to open track {} in '{}': track start is out of range ({} vs {})", track_num, name,
+                  track_start, file_size);
+        Error::SetStringFmt(error, "Failed to open track {} in '{}': track start is out of range ({} vs {}))",
+                            track_num, name, track_start, file_size);
+        return false;
+      }
+
+      track_length = static_cast<LBA>(file_size - track_start);
+    }
+    else
+    {
+      track_length = track->length.value().ToLBA();
+    }
+
+    const Position* index0 = track->GetIndex(0);
+    LBA pregap_frames;
+    if (index0)
+    {
+      pregap_frames = track->GetIndex(1)->ToLBA() - index0->ToLBA();
+
+      Index pregap_index = {};
+      pregap_index.start_lba_on_disc = disc_lba;
+      pregap_index.start_lba_in_track = static_cast<LBA>(-static_cast<s32>(pregap_frames));
+      pregap_index.length = pregap_frames;
+      pregap_index.track_number = track_num;
+      pregap_index.index_number = 0;
+      pregap_index.mode = mode;
+      pregap_index.submode = CDImage::SubchannelMode::None;
+      pregap_index.control.bits = control.bits;
+      pregap_index.is_pregap = true;
+      pregap_index.file_index = track_file_index;
+      pregap_index.file_offset = static_cast<u64>(static_cast<s64>(track_start - pregap_frames)) * track_sector_size;
+      pregap_index.file_sector_size = track_sector_size;
+
+      m_indices.push_back(pregap_index);
+
+      disc_lba += pregap_index.length;
+    }
+    else
+    {
+      const bool is_multi_track_bin = (track_num > 1 && track_file_index == m_indices[0].file_index);
+      const bool likely_audio_cd = (parser.GetTrack(1)->mode == TrackMode::Audio);
+
+      pregap_frames = track->zero_pregap.has_value() ? track->zero_pregap->ToLBA() : 0;
+      if ((track_num == 1 || is_multi_track_bin) && !track->zero_pregap.has_value() &&
+          (track_num == 1 || !likely_audio_cd))
+      {
+        pregap_frames = 2 * FRAMES_PER_SECOND;
+      }
+
+      if (pregap_frames > 0)
+      {
+        Index pregap_index = {};
+        pregap_index.start_lba_on_disc = disc_lba;
+        pregap_index.start_lba_in_track = static_cast<LBA>(-static_cast<s32>(pregap_frames));
+        pregap_index.length = pregap_frames;
+        pregap_index.track_number = track_num;
+        pregap_index.index_number = 0;
+        pregap_index.mode = mode;
+        pregap_index.submode = CDImage::SubchannelMode::None;
+        pregap_index.control.bits = control.bits;
+        pregap_index.is_pregap = true;
+        m_indices.push_back(pregap_index);
+
+        disc_lba += pregap_index.length;
+      }
+    }
+
+    m_tracks.push_back(Track{track_num, disc_lba, static_cast<u32>(m_indices.size()), track_length + pregap_frames,
+                             mode, SubchannelMode::None, control});
+
+    Index last_index;
+    last_index.start_lba_on_disc = disc_lba;
+    last_index.start_lba_in_track = 0;
+    last_index.track_number = track_num;
+    last_index.index_number = 1;
+    last_index.file_index = track_file_index;
+    last_index.file_sector_size = track_sector_size;
+    last_index.file_offset = static_cast<u64>(track_start) * track_sector_size;
+    last_index.mode = mode;
+    last_index.submode = CDImage::SubchannelMode::None;
+    last_index.control.bits = control.bits;
+    last_index.is_pregap = false;
+
+    u32 last_index_offset = track_start;
+    for (u32 index_num = 1;; index_num++)
+    {
+      const Position* pos = track->GetIndex(index_num);
+      if (!pos)
+        break;
+
+      const u32 index_offset = pos->ToLBA();
+
+      if (index_offset > last_index_offset)
+      {
+        last_index.length = index_offset - last_index_offset;
+        m_indices.push_back(last_index);
+
+        disc_lba += last_index.length;
+        last_index.start_lba_in_track += last_index.length;
+        last_index.start_lba_on_disc = disc_lba;
+        last_index.length = 0;
+      }
+
+      last_index.file_offset = index_offset * last_index.file_sector_size;
+      last_index.index_number = static_cast<u32>(index_num);
+      last_index_offset = index_offset;
+    }
+
+    const u32 track_end_index = track_start + track_length;
+    DebugAssert(track_end_index >= last_index_offset);
+    if (track_end_index > last_index_offset)
+    {
+      last_index.length = track_end_index - last_index_offset;
+      m_indices.push_back(last_index);
+
+      disc_lba += last_index.length;
+    }
+  }
+
+  if (m_tracks.empty())
+  {
+    ERROR_LOG("File '{}' contains no tracks", name);
+    Error::SetStringFmt(error, "File '{}' contains no tracks", name);
+    return false;
+  }
+
+  m_lba_count = disc_lba;
+  AddLeadOutIndex();
+
+  return Seek(1, Position{0, 0, 0});
+}
+
 bool CDImageCueSheet::OpenAndParseSingleFile(const char* path, Error* error)
 {
   m_filename = path;
@@ -821,6 +1085,59 @@ bool CDImageCueSheet::OpenAndParseSingleFile(const char* path, Error* error)
 
   const u32 track_sector_size = RAW_SECTOR_SIZE;
   m_lba_count = Truncate32(fi->GetSize() / track_sector_size);
+  m_files.push_back(std::move(fi));
+
+  SubChannelQ::Control control = {};
+  TrackMode mode = TrackMode::Mode2Raw;
+  control.data = mode != TrackMode::Audio;
+
+  // Two seconds default pregap.
+  const u32 pregap_frames = 2 * FRAMES_PER_SECOND;
+  Index pregap_index = {};
+  pregap_index.file_sector_size = track_sector_size;
+  pregap_index.start_lba_on_disc = 0;
+  pregap_index.start_lba_in_track = static_cast<LBA>(-static_cast<s32>(pregap_frames));
+  pregap_index.length = pregap_frames;
+  pregap_index.track_number = 1;
+  pregap_index.index_number = 0;
+  pregap_index.mode = mode;
+  pregap_index.submode = CDImage::SubchannelMode::None;
+  pregap_index.control.bits = control.bits;
+  pregap_index.is_pregap = true;
+  m_indices.push_back(pregap_index);
+
+  // Data index.
+  Index data_index = {};
+  data_index.file_index = 0;
+  data_index.file_offset = 0;
+  data_index.file_sector_size = track_sector_size;
+  data_index.start_lba_on_disc = pregap_index.length;
+  data_index.track_number = 1;
+  data_index.index_number = 1;
+  data_index.start_lba_in_track = 0;
+  data_index.length = m_lba_count;
+  data_index.mode = mode;
+  data_index.submode = CDImage::SubchannelMode::None;
+  data_index.control.bits = control.bits;
+  m_indices.push_back(data_index);
+
+  // Assume a single track.
+  m_tracks.push_back(Track{static_cast<u32>(1), data_index.start_lba_on_disc, static_cast<u32>(0),
+                           m_lba_count + pregap_frames, mode, SubchannelMode::None, control});
+
+  AddLeadOutIndex();
+
+  return Seek(1, Position{0, 0, 0});
+}
+
+bool CDImageCueSheet::OpenFromMemory(const std::string& name, std::vector<u8> data, Error* error)
+{
+  m_filename = name;
+
+  const u32 track_sector_size = RAW_SECTOR_SIZE;
+  m_lba_count = Truncate32(data.size() / track_sector_size);
+
+  auto fi = std::make_unique<MemoryTrackFileInterface>(name, std::move(data));
   m_files.push_back(std::move(fi));
 
   SubChannelQ::Control control = {};
@@ -906,5 +1223,23 @@ std::unique_ptr<CDImage> CDImage::OpenBinImage(const char* path, Error* error)
   if (!image->OpenAndParseSingleFile(path, error))
     image.reset();
 
+  return image;
+}
+
+std::unique_ptr<CDImage> CDImage::OpenMemoryBinImage(const std::string& name, std::vector<u8> data, Error* error)
+{
+  std::unique_ptr<CDImageCueSheet> image = std::make_unique<CDImageCueSheet>();
+  if (!image->OpenFromMemory(name, std::move(data), error))
+    image.reset();
+  return image;
+}
+
+std::unique_ptr<CDImage> CDImage::OpenMemoryCueImage(
+  const std::string& name, std::string cue_text, std::vector<std::pair<std::string, std::vector<u8>>> files,
+  Error* error)
+{
+  std::unique_ptr<CDImageCueSheet> image = std::make_unique<CDImageCueSheet>();
+  if (!image->OpenAndParseCueSheetFromMemory(name, std::move(cue_text), std::move(files), error))
+    image.reset();
   return image;
 }

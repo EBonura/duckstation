@@ -200,6 +200,10 @@ public:
   static std::unique_ptr<CDImage> OpenM3uImage(const char* path, bool apply_patches, Error* error);
   static std::unique_ptr<CDImage> OpenDeviceImage(const char* path, Error* error);
   static std::unique_ptr<CDImage> CreateMemoryImage(CDImage* image, ProgressCallback* progress, Error* error);
+  static std::unique_ptr<CDImage> OpenMemoryBinImage(const std::string& name, std::vector<u8> data, Error* error);
+  static std::unique_ptr<CDImage> OpenMemoryCueImage(const std::string& name, std::string cue_text,
+                                                     std::vector<std::pair<std::string, std::vector<u8>>> files,
+                                                     Error* error);
   static std::unique_ptr<CDImage> OverlayPPFPatch(const char* path, std::unique_ptr<CDImage> parent_image,
                                                   Error* error);
 
